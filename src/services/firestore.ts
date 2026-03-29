@@ -1,3 +1,4 @@
+import '@/services/firebase';
 import firestore from '@react-native-firebase/firestore';
 import type { Clinic } from '@/types/clinic';
 import type { User } from '@/types/user';
@@ -6,11 +7,23 @@ import type { Appointment } from '@/types/appointment';
 import type { Addon } from '@/types/subscription';
 import type { Discount } from '@/types/discount';
 
+import { Platform } from 'react-native';
+
 const USE_EMULATOR = process.env.EXPO_PUBLIC_USE_EMULATOR === 'true';
-const EMULATOR_HOST = process.env.EXPO_PUBLIC_EMULATOR_HOST ?? 'localhost';
+const DEFAULT_HOST = process.env.EXPO_PUBLIC_EMULATOR_HOST ?? 'localhost';
+const EMULATOR_HOST = Platform.OS === 'android' && DEFAULT_HOST === 'localhost' 
+  ? '10.0.2.2' 
+  : DEFAULT_HOST;
 
 if (USE_EMULATOR) {
   firestore().useEmulator(EMULATOR_HOST, 8080);
+  // Disable persistence when using the emulator to avoid cache poisoning from production
+  firestore().settings({ 
+    persistence: false,
+    // Add cacheSizeBytes for completeness if needed in some versions
+    cacheSizeBytes: firestore.CACHE_SIZE_UNLIMITED 
+  });
+  console.log(`[Firestore] Connected to emulator at ${EMULATOR_HOST}:8080`);
 }
 
 // --- Clinics ---
@@ -23,26 +36,39 @@ export function subscribeToClinic(
     .collection('clinics')
     .doc(clinicId)
     .onSnapshot((snap) => {
-      if (snap.exists()) {
+      console.log(`[Firestore] Snapshot for clinic: ${clinicId} (exists: ${snap.exists})`);
+      if (snap.exists) {
         onUpdate({ id: snap.id, ...snap.data() } as Clinic);
       }
+    }, (err) => {
+      console.error(`[Firestore] Error subscribing to clinic ${clinicId}:`, err);
     });
 }
 
 // --- Users ---
 
 export async function getUser(userId: string): Promise<User | null> {
-  const snap = await firestore().collection('users').doc(userId).get();
-  if (!snap.exists()) return null;
-  return { id: snap.id, ...snap.data() } as User;
+  try {
+    const snap = await firestore().collection('users').doc(userId).get();
+    if (!snap.exists) return null;
+    return { id: snap.id, ...snap.data() } as User;
+  } catch (err) {
+    console.error(`[Firestore] Error getting user ${userId}:`, err);
+    throw err;
+  }
 }
 
 export async function getClinicMembers(clinicId: string): Promise<User[]> {
-  const snap = await firestore()
-    .collection('users')
-    .where('clinicId', '==', clinicId)
-    .get();
-  return snap.docs.map((d) => ({ id: d.id, ...d.data() } as User));
+  try {
+    const snap = await firestore()
+      .collection('users')
+      .where('clinicId', '==', clinicId)
+      .get();
+    return snap.docs.map((d) => ({ id: d.id, ...d.data() } as User));
+  } catch (err) {
+    console.error(`[Firestore] Error getting clinic members for ${clinicId}:`, err);
+    return [];
+  }
 }
 
 // --- Subscriptions ---
@@ -55,9 +81,12 @@ export function subscribeToSubscription(
     .collection('subscriptions')
     .doc(clinicId)
     .onSnapshot((snap) => {
-      if (snap.exists()) {
+      console.log(`[Firestore] Snapshot for subscription: ${clinicId} (exists: ${snap.exists})`);
+      if (snap.exists) {
         onUpdate({ clinicId, ...snap.data() } as Subscription);
       }
+    }, (err) => {
+      console.error(`[Firestore] Error subscribing to subscription ${clinicId}:`, err);
     });
 }
 
@@ -72,8 +101,11 @@ export function subscribeToClinicAppointments(
     .where('clinicId', '==', clinicId)
     .orderBy('datetime', 'asc')
     .onSnapshot((snap) => {
+      console.log(`[Firestore] Snapshot for clinic appointments: ${clinicId} (count: ${snap.size})`);
       const appointments = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Appointment));
       onUpdate(appointments);
+    }, (err) => {
+      console.error(`[Firestore] Error subscribing to clinic appointments ${clinicId}:`, err);
     });
 }
 
@@ -86,8 +118,11 @@ export function subscribeToPatientAppointments(
     .where('patientId', '==', patientId)
     .orderBy('datetime', 'asc')
     .onSnapshot((snap) => {
+      console.log(`[Firestore] Snapshot for patient appointments: ${patientId} (count: ${snap.size})`);
       const appointments = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Appointment));
       onUpdate(appointments);
+    }, (err) => {
+      console.error(`[Firestore] Error subscribing to patient appointments ${patientId}:`, err);
     });
 }
 

@@ -3,13 +3,20 @@
 // The client calls Firebase Functions, which call Stripe server-side.
 // This keeps the Stripe secret key off the device.
 
+import '@/services/firebase';
 import functions from '@react-native-firebase/functions';
 
+import { Platform } from 'react-native';
+
 const USE_EMULATOR = process.env.EXPO_PUBLIC_USE_EMULATOR === 'true';
-const EMULATOR_HOST = process.env.EXPO_PUBLIC_EMULATOR_HOST ?? 'localhost';
+const DEFAULT_HOST = process.env.EXPO_PUBLIC_EMULATOR_HOST ?? 'localhost';
+const EMULATOR_HOST = Platform.OS === 'android' && DEFAULT_HOST === 'localhost' 
+  ? '10.0.2.2' 
+  : DEFAULT_HOST;
 
 if (USE_EMULATOR) {
   functions().useEmulator(EMULATOR_HOST, 5001);
+  console.log(`[Functions] Connected to emulator at http://${EMULATOR_HOST}:5001`);
 }
 
 export type CreateCheckoutParams = {
@@ -32,9 +39,10 @@ export type CheckoutResult = {
 //
 // The Cloud Function stub is at functions/src/stripe/checkout.ts
 export async function createCheckoutSession(
-  _params: CreateCheckoutParams,
+  params: CreateCheckoutParams,
 ): Promise<CheckoutResult> {
-  throw new Error('TODO [CHALLENGE]: Implement createCheckoutSession');
+  const result = await functions().httpsCallable('createCheckoutSession')(params);
+  return result.data as CheckoutResult;
 }
 
 export type AddonPurchaseParams = {
@@ -49,9 +57,9 @@ export type AddonPurchaseParams = {
 // A discount with appliesToBase: true, appliesToAddons: [] does NOT apply here.
 // Validate this server-side in the Cloud Function.
 export async function purchaseAddon(
-  _params: AddonPurchaseParams,
+  params: AddonPurchaseParams,
 ): Promise<void> {
-  throw new Error('TODO [CHALLENGE]: Implement purchaseAddon');
+  await functions().httpsCallable('purchaseAddon')(params);
 }
 
 export type DowngradeParams = {
@@ -75,7 +83,8 @@ export type DowngradeResult = {
 //   4. If queued: set a flag in Firestore, enforce in rules until resolved
 //   5. Firestore rules must block new seat additions during the downgrade-pending state
 export async function initiateDowngrade(
-  _params: DowngradeParams,
+  params: DowngradeParams,
 ): Promise<DowngradeResult> {
-  throw new Error('TODO [CHALLENGE]: Implement initiateDowngrade');
+  const result = await functions().httpsCallable("initiateDowngrade")(params);
+  return result.data as DowngradeResult;
 }

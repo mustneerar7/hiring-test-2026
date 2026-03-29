@@ -1,55 +1,77 @@
-import * as functions from 'firebase-functions';
-import * as admin from 'firebase-admin';
-import Stripe from 'stripe';
+import { onCall, HttpsError, CallableRequest } from "firebase-functions/v2/https";
+import * as admin from "firebase-admin";
+import Stripe from "stripe";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2024-09-30.acacia',
-});
-
-// Stripe Price IDs — set these in Firebase config or environment variables
-// Replace with real price IDs from your Stripe dashboard
-const PRICE_IDS: Record<string, string> = {
-  pro:                'price_PRO_REPLACE_ME',
-  premium:            'price_PREMIUM_REPLACE_ME',
-  vip:                'price_VIP_REPLACE_ME',
-  extra_storage:      'price_STORAGE_REPLACE_ME',
-  extra_seats:        'price_SEATS_REPLACE_ME',
-  advanced_analytics: 'price_ANALYTICS_REPLACE_ME',
+let stripeInstance: Stripe;
+const getStripe = () => {
+  if (!stripeInstance) {
+    if (!process.env.STRIPE_SECRET_KEY) {
+      throw new HttpsError("internal", "STRIPE_SECRET_KEY is not set in environment variables");
+    }
+    stripeInstance = new Stripe(process.env.STRIPE_SECRET_KEY, {
+      apiVersion: "2025-02-24.acacia",
+    });
+  }
+  return stripeInstance;
 };
 
-/**
- * Creates a Stripe Checkout session for plan upgrades.
- * Called from the React Native app via Firebase Functions callable.
- */
-export const createCheckoutSession = functions.https.onCall(async (data, context) => {
-  if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'Must be signed in');
+// Dynamic Price Resolution (removes the need for manual Dashboard configuration)
+async function getOrCreatePriceId(planOrAddon: string): Promise<string> {
+  const stripe = getStripe();
+  // Search for an existing product with this metadata key
+  const products = await stripe.products.search({ query: `metadata['key']:'${planOrAddon}'` });
+  
+  if (products.data.length > 0) {
+    const prices = await stripe.prices.list({ product: products.data[0].id, active: true });
+    if (prices.data.length > 0) return prices.data[0].id;
+  }
+
+  // If not found, create a generic test product and monthly price dynamically
+  const product = await stripe.products.create({
+    name: planOrAddon.replace('_', ' ').toUpperCase(),
+    metadata: { key: planOrAddon }
+  });
+
+  const price = await stripe.prices.create({
+    product: product.id,
+    unit_amount: planOrAddon.includes('add') ? 1500 : 5000, 
+    currency: 'usd',
+    recurring: { interval: 'month' }
+  });
+
+  return price.id;
+}
+
+export const createCheckoutSession = onCall(async (request: CallableRequest) => {
+  const { auth, data } = request;
+  if (!auth) throw new HttpsError("unauthenticated", "Must be signed in");
 
   const { clinicId, plan, discountCode } = data as {
     clinicId: string;
-    plan: 'pro' | 'premium' | 'vip';
+    plan: "pro" | "premium" | "vip";
     discountCode?: string;
   };
 
   const db = admin.firestore();
 
   // Verify caller is the clinic owner
-  const userDoc = await db.collection('users').doc(context.auth.uid).get();
+  const userDoc = await db.collection("users").doc(auth.uid).get();
   const user = userDoc.data();
-  if (!user || user.role !== 'owner' || user.clinicId !== clinicId) {
-    throw new functions.https.HttpsError('permission-denied', 'Only clinic owners can manage billing');
+  if (!user || user.role !== "owner" || user.clinicId !== clinicId) {
+    throw new HttpsError("permission-denied", "Only clinic owners can manage billing");
   }
 
   // Get or create Stripe customer
-  const subDoc = await db.collection('subscriptions').doc(clinicId).get();
-  const sub = subDoc.data();
+  const subDoc = await db.collection("subscriptions").doc(clinicId).get();
+  const subData = subDoc.data();
   let customerId: string;
 
-  if (sub?.stripeCustomerId) {
-    customerId = sub.stripeCustomerId;
+  if (subData?.stripeCustomerId) {
+    customerId = subData.stripeCustomerId;
   } else {
-    const clinicDoc = await db.collection('clinics').doc(clinicId).get();
+    const clinicDoc = await db.collection("clinics").doc(clinicId).get();
     const clinic = clinicDoc.data();
-    const customer = await stripe.customers.create({
+    const customer = await getStripe().customers.create({
       email: user.email,
       name: clinic?.name,
       metadata: { clinicId },
@@ -57,115 +79,271 @@ export const createCheckoutSession = functions.https.onCall(async (data, context
     customerId = customer.id;
   }
 
-  // TODO [CHALLENGE]: Validate and apply discount code (Scenario 3 & 5).
-  // Before creating the session:
-  //   1. Look up the discount in Firestore by code
-  //   2. Check isDiscountValid() — reject expired codes (Scenario 5)
-  //   3. Check appliesToBase — if false, do not apply to the base plan checkout
-  //   4. If valid and applicable, create or retrieve a Stripe Coupon and attach to session
-  //   5. Increment discount.usedCount atomically (Firestore transaction)
+  // Validate discount code if provided
   let stripeCouponId: string | undefined;
   if (discountCode) {
-    console.log('TODO [CHALLENGE]: Validate and apply discount code:', discountCode);
+    const discountsSnap = await db.collection("discounts").where("code", "==", discountCode).limit(1).get();
+    if (discountsSnap.empty) {
+      throw new HttpsError("invalid-argument", "Invalid discount code");
+    }
+    const discountDoc = discountsSnap.docs[0];
+    const discountData = discountDoc.data();
+    
+    const validUntil = discountData.validUntil?.toDate();
+    const now = new Date();
+    if (validUntil && validUntil < now) {
+      throw new HttpsError("invalid-argument", "Discount code has expired");
+    }
+    if (discountData.usageLimit && discountData.usedCount >= discountData.usageLimit) {
+      throw new HttpsError("invalid-argument", "Discount code usage limit reached");
+    }
+    if (!discountData.appliesToBase) {
+      throw new HttpsError("invalid-argument", "Discount code does not apply to base plans");
+    }
+
+    try {
+      await getStripe().coupons.retrieve(discountCode);
+      stripeCouponId = discountCode;
+    } catch {
+      const coupon = await getStripe().coupons.create({
+        id: discountCode,
+        percent_off: discountData.percentOff,
+        duration: "once",
+      });
+      stripeCouponId = coupon.id;
+    }
+
+    // Increment usage
+    await discountDoc.ref.update({ usedCount: admin.firestore.FieldValue.increment(1) });
   }
 
-  const session = await stripe.checkout.sessions.create({
-    customer: customerId,
-    mode: 'subscription',
-    line_items: [{ price: PRICE_IDS[plan], quantity: 1 }],
-    ...(stripeCouponId ? { discounts: [{ coupon: stripeCouponId }] } : {}),
-    metadata: { clinicId, plan },
-    success_url: 'clinicapp://billing?success=true',
-    cancel_url: 'clinicapp://billing?canceled=true',
-  });
+  // Update existing subscription or create new checkout session
+  if (subData?.stripeSubscriptionId && subData.plan !== "free") {
+    const subscription = await getStripe().subscriptions.retrieve(subData.stripeSubscriptionId);
+    const itemId = subscription.items.data[0].id;
+    await getStripe().subscriptions.update(subData.stripeSubscriptionId, {
+      items: [{ id: itemId, price: await getOrCreatePriceId(plan) }],
+      proration_behavior: "create_prorations",
+      metadata: { clinicId, plan },
+      ...(stripeCouponId ? { discounts: [{ coupon: stripeCouponId }] } : {}),
+    });
+    
+    return { sessionId: "direct_upgrade", url: "clinicapp://billing?success=true" };
+  } else {
+    const session = await getStripe().checkout.sessions.create({
+      customer: customerId,
+      mode: "subscription",
+      line_items: [{ price: await getOrCreatePriceId(plan), quantity: 1 }],
+      metadata: { clinicId, plan },
+      ...(stripeCouponId ? { discounts: [{ coupon: stripeCouponId }] } : {}),
+      success_url: "clinicapp://billing?success=true",
+      cancel_url: "clinicapp://billing?canceled=true",
+    });
 
-  return { sessionId: session.id, url: session.url };
+    return { sessionId: session.id, url: session.url };
+  }
 });
 
-/**
- * Purchases an add-on for a clinic.
- */
-export const purchaseAddon = functions.https.onCall(async (data, context) => {
-  if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'Must be signed in');
+export const purchaseAddon = onCall(async (request: CallableRequest) => {
+  const { auth, data } = request;
+  if (!auth) throw new HttpsError("unauthenticated", "Must be signed in");
 
   const { clinicId, addonType, discountCode } = data as {
     clinicId: string;
-    addonType: 'extra_storage' | 'extra_seats' | 'advanced_analytics';
+    addonType: "extra_storage" | "extra_seats" | "advanced_analytics";
     discountCode?: string;
   };
 
-  // TODO [CHALLENGE]: Implement add-on purchase (Scenario 3).
-  // Steps:
-  //   1. Verify caller is owner of clinicId
-  //   2. Look up the clinic's active Stripe subscription
-  //   3. Add a new subscription item for the add-on price
-  //   4. If discountCode provided:
-  //      a. Fetch discount from Firestore
-  //      b. Check appliesToAddons — does it include this addonType or 'all'?
-  //      c. IMPORTANT: A discount that applies to base plan only must NOT apply here
-  //      d. Apply applicable discount to the subscription item
-  //   5. On success, write addon record to addons/{clinicId}/items/{addonId}
-  //   6. Update clinic.addons array
-  console.log('TODO [CHALLENGE]: Implement purchaseAddon for', addonType, 'clinic', clinicId, discountCode);
-  throw new functions.https.HttpsError('unimplemented', 'TODO [CHALLENGE]: Implement purchaseAddon');
+  const db = admin.firestore();
+
+  // Verify caller is the clinic owner
+  const userDoc = await db.collection("users").doc(auth.uid).get();
+  const user = userDoc.data();
+  if (!user || user.role !== "owner" || user.clinicId !== clinicId) {
+    throw new HttpsError("permission-denied", "Only clinic owners can manage billing");
+  }
+
+  const subDoc = await db.collection("subscriptions").doc(clinicId).get();
+  const subData = subDoc.data();
+  if (!subData?.stripeSubscriptionId || subData.status !== "active") {
+    throw new HttpsError("failed-precondition", "Active subscription required to purchase addons");
+  }
+
+  // Validate discount code if provided
+  let stripeCouponId: string | undefined;
+  if (discountCode) {
+    const discountsSnap = await db.collection("discounts").where("code", "==", discountCode).limit(1).get();
+    if (discountsSnap.empty) {
+      throw new HttpsError("invalid-argument", "Invalid discount code");
+    }
+    const discountDoc = discountsSnap.docs[0];
+    const discountData = discountDoc.data();
+    
+    const validUntil = discountData.validUntil?.toDate();
+    const now = new Date();
+    if (validUntil && validUntil < now) {
+      throw new HttpsError("invalid-argument", "Discount code has expired");
+    }
+    if (discountData.usageLimit && discountData.usedCount >= discountData.usageLimit) {
+      throw new HttpsError("invalid-argument", "Discount code usage limit reached");
+    }
+
+    // Verify it applies to addons!
+    const appliesToAddons = discountData.appliesToAddons;
+    let applies = false;
+    if (appliesToAddons === "all") {
+      applies = true;
+    } else if (Array.isArray(appliesToAddons) && appliesToAddons.includes(addonType)) {
+      applies = true;
+    }
+
+    if (!applies) {
+      throw new HttpsError("invalid-argument", "Discount code does not apply to this add-on");
+    }
+
+    try {
+      await getStripe().coupons.retrieve(discountCode);
+      stripeCouponId = discountCode;
+    } catch {
+      const coupon = await getStripe().coupons.create({
+        id: discountCode,
+        percent_off: discountData.percentOff,
+        duration: "once",
+      });
+      stripeCouponId = coupon.id;
+    }
+
+    // Increment usage
+    await discountDoc.ref.update({ usedCount: admin.firestore.FieldValue.increment(1) });
+  }
+
+  const subscription = await getStripe().subscriptions.retrieve(subData.stripeSubscriptionId);
+  const targetPriceId = await getOrCreatePriceId(addonType);
+  const existingItem = subscription.items.data.find(item => item.price.id === targetPriceId);
+
+  const itemPayload: any = existingItem 
+    ? { id: existingItem.id, quantity: (existingItem.quantity || 1) + 1 }
+    : { price: targetPriceId, quantity: 1 };
+
+  if (stripeCouponId) {
+    // Add discount array directly to the new/updated subscription item
+    itemPayload.discounts = [{ coupon: stripeCouponId }];
+  }
+
+  await getStripe().subscriptions.update(subData.stripeSubscriptionId, {
+    items: [itemPayload],
+    proration_behavior: "always_invoice",
+    metadata: { clinicId },
+  });
+
+  return { success: true };
 });
 
-/**
- * Initiates a plan downgrade with seat conflict detection.
- */
-export const initiateDowngrade = functions.https.onCall(async (data, context) => {
-  if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'Must be signed in');
+export const initiateDowngrade = onCall(async (request: CallableRequest) => {
+  const { auth, data } = request;
+  if (!auth) throw new HttpsError("unauthenticated", "Must be signed in");
 
   const { clinicId, targetPlan } = data as {
     clinicId: string;
-    targetPlan: 'free' | 'pro' | 'premium';
+    targetPlan: "free" | "pro" | "premium";
   };
 
-  // TODO [CHALLENGE]: Implement downgrade with seat conflict handling (Scenario 2).
-  // This is the core design challenge. Your approach:
-  //
-  // 1. Count active seats: query seats/{clinicId}/members where active == true
-  // 2. Get target plan's seat limit from PLAN_CONFIG
-  // 3. If activeSeats <= targetSeatLimit: proceed with immediate downgrade
-  //    - Update Stripe subscription to new price
-  //    - Let webhook handle Firestore update
-  // 4. If activeSeats > targetSeatLimit: SEAT CONFLICT
-  //    - Option A: Block downgrade, return conflict info, require owner to deactivate staff first
-  //    - Option B: Queue downgrade for end of billing period, show warning in UI
-  //    - Pick one. Document your reasoning in DECISIONS.md.
-  //    - Whichever you choose: Firestore rules must enforce the pending state
-  //      (e.g., no new staff can join while downgrade is queued)
-  //
-  // Return DowngradeResult (see stripe.ts type) so the UI can show appropriate state.
-  console.log('TODO [CHALLENGE]: Implement initiateDowngrade to', targetPlan, 'for clinic', clinicId);
-  throw new functions.https.HttpsError('unimplemented', 'TODO [CHALLENGE]: Implement initiateDowngrade');
+  const db = admin.firestore();
+
+  // Verify caller is the clinic owner
+  const userDoc = await db.collection("users").doc(auth.uid).get();
+  const user = userDoc.data();
+  if (!user || user.role !== "owner" || user.clinicId !== clinicId) {
+    throw new HttpsError("permission-denied", "Only clinic owners can manage billing");
+  }
+
+  const clinicDoc = await db.collection("clinics").doc(clinicId).get();
+  const clinic = clinicDoc.data();
+  if (!clinic) throw new HttpsError("not-found", "Clinic not found");
+
+  const { PLAN_CONFIG_SERVER } = await import("./planConfig");
+  const targetConfig = (PLAN_CONFIG_SERVER as any)[targetPlan];
+  const activeSeats = clinic.seats?.used || 0;
+
+  // Assuming no addons in simple scenario, or just checking base config
+  if (activeSeats > targetConfig.seats) {
+    return {
+      strategy: "immediate",
+      conflictingSeats: activeSeats - targetConfig.seats,
+    };
+  }
+
+  // Attempt to update Stripe subscription
+  const subDoc = await db.collection("subscriptions").doc(clinicId).get();
+  const subData = subDoc.data();
+
+  if (subData?.stripeSubscriptionId) {
+    if (targetPlan === "free") {
+      await getStripe().subscriptions.cancel(subData.stripeSubscriptionId);
+    } else {
+      const subscription = await getStripe().subscriptions.retrieve(subData.stripeSubscriptionId);
+      const itemId = subscription.items.data[0].id;
+      await getStripe().subscriptions.update(subData.stripeSubscriptionId, {
+        items: [{ id: itemId, price: await getOrCreatePriceId(targetPlan) }],
+        proration_behavior: "always_invoice",
+        metadata: { clinicId, plan: targetPlan },
+      });
+    }
+  }
+
+  return { strategy: "immediate" };
 });
 
-/**
- * Removes a staff member and invalidates their session.
- * Must be atomic: seat decrement + role update + session revocation in one operation.
- */
-export const removeStaffMember = functions.https.onCall(async (data, context) => {
-  if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'Must be signed in');
+export const removeStaffMember = onCall(async (request: CallableRequest) => {
+  const { auth, data } = request;
+  if (!auth) throw new HttpsError("unauthenticated", "Must be signed in");
 
-  const { clinicId, targetUserId } = data as { clinicId: string; targetUserId: string };
+  const { clinicId, userId } = data as { clinicId: string; userId: string };
 
-  // TODO [CHALLENGE]: Implement staff removal + session invalidation (Scenario 6).
-  // Steps:
-  //   1. Verify caller is owner of clinicId
-  //   2. Verify targetUserId is a staff member (not owner) of clinicId
-  //   3. In a Firestore transaction:
-  //      a. Set seats/{clinicId}/members/{targetUserId}.active = false
-  //      b. Update users/{targetUserId}: clear clinicId, set role to 'patient'
-  //      c. Decrement clinic.seats.used
-  //   4. Revoke Firebase Auth refresh tokens for targetUserId:
-  //      admin.auth().revokeRefreshTokens(targetUserId)
-  //      This invalidates ALL active sessions for that user immediately.
-  //   5. Optionally notify the removed user
-  //
-  // Note on token revocation: Firebase tokens are valid for 1 hour after revocation.
-  // To enforce immediate blocking, Firestore rules must check the user's active status,
-  // not just their role. The rules in seats/ are intentionally incomplete — add this check.
-  console.log('TODO [CHALLENGE]: Implement removeStaffMember for', targetUserId, 'in clinic', clinicId);
-  throw new functions.https.HttpsError('unimplemented', 'TODO [CHALLENGE]: Implement removeStaffMember');
+  const db = admin.firestore();
+
+  // Verify caller is the clinic owner
+  const userDoc = await db.collection("users").doc(auth.uid).get();
+  const user = userDoc.data();
+  if (!user || user.role !== "owner" || user.clinicId !== clinicId) {
+    throw new HttpsError("permission-denied", "Only clinic owners can remove staff");
+  }
+
+  // Deactivate the seat inside Firestore
+  await db.collection("seats").doc(clinicId).collection("members").doc(userId).update({
+    active: false,
+  });
+
+  // OPTION A: Revoke refresh tokens server-side forcing automatic logout when short-lived ID token expires.
+  await admin.auth().revokeRefreshTokens(userId);
+
+  // Disassociate the user from the clinic globally
+  await db.collection("users").doc(userId).update({
+    clinicId: null,
+  });
+
+  return { success: true };
+});
+
+export const revokeUserSession = onCall(async (request: CallableRequest) => {
+  const { auth, data } = request;
+  if (!auth) throw new HttpsError("unauthenticated", "Must be signed in");
+
+  const { userId } = data as { userId: string };
+
+  const db = admin.firestore();
+
+  // Verify caller is a clinic owner of the user they are deleting
+  const targetUserDoc = await db.collection("users").doc(userId).get();
+  const targetUser = targetUserDoc.data();
+  
+  if (targetUser?.clinicId) {
+    const callerDoc = await db.collection("users").doc(auth.uid).get();
+    if (callerDoc.data()?.clinicId !== targetUser.clinicId || callerDoc.data()?.role !== "owner") {
+      throw new HttpsError("permission-denied", "Unauthorized to revoke this session");
+    }
+  }
+
+  await admin.auth().revokeRefreshTokens(userId);
+  return { success: true };
 });

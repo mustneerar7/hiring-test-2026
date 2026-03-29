@@ -10,6 +10,7 @@ import { signOut } from '@/services/auth';
 import { PlanBadge } from '@/components/PlanBadge';
 import { PLAN_CONFIG } from '@/types/subscription';
 import type { Plan } from '@/types/subscription';
+import { createCheckoutSession, initiateDowngrade } from '@/services/stripe';
 
 const UPGRADE_OPTIONS: Plan[] = ['pro', 'premium', 'vip'];
 const DOWNGRADE_OPTIONS: Plan[] = ['free', 'pro', 'premium'];
@@ -24,17 +25,31 @@ export default function SettingsScreen() {
     router.replace('/(auth)/login');
   }
 
-  function handleUpgrade(targetPlan: Plan) {
-    // TODO [CHALLENGE]: Navigate to Stripe Checkout for upgrade (Scenario 1)
-    Alert.alert('TODO', `Implement upgrade to ${targetPlan}`);
+  async function handleUpgrade(targetPlan: Plan) {
+    try {
+      const result = await createCheckoutSession({ clinicId: clinic!.id, plan: targetPlan as 'pro' | 'premium' | 'vip' });
+      if (result.url) {
+        console.log('--- STRIPE CHECKOUT URL ---');
+        console.log(result.url);
+        console.log('---------------------------');
+        Alert.alert('Checkout created', 'URL has been logged to the console. Please copy and open in your browser.');
+      }
+    } catch (e: any) {
+      Alert.alert('Error', e.message);
+    }
   }
 
-  function handleDowngrade(targetPlan: Plan) {
-    // TODO [CHALLENGE]: Implement downgrade with seat conflict detection (Scenario 2)
-    // Before calling Stripe, check if active seats > targetPlan's seat limit.
-    // If conflict: show modal asking user to deactivate excess staff OR queue for end of cycle.
-    // Document your chosen strategy in DECISIONS.md.
-    Alert.alert('TODO', `Implement downgrade to ${targetPlan} — see Scenario 2`);
+  async function handleDowngrade(targetPlan: Plan) {
+    try {
+      const result = await initiateDowngrade({ clinicId: clinic!.id, targetPlan: targetPlan as 'free' | 'pro' | 'premium' });
+      if (result.strategy === 'immediate') {
+         Alert.alert('Downgrade Blocked', `Please remove ${result.conflictingSeats} active staff members before downgrading.`);
+      } else {
+         Alert.alert('Success', `Plan successfully downgraded to ${targetPlan}.`);
+      }
+    } catch (e: any) {
+      Alert.alert('Error', e.message);
+    }
   }
 
   return (

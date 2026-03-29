@@ -1,15 +1,8 @@
-import { getApp, getApps, initializeApp } from '@react-native-firebase/app';
+// React Native Firebase initializes the default app natively via google-services.json
+// (Android) and GoogleService-Info.plist (iOS). We just need to import the module
+// so the native SDK is loaded before any other Firebase service is used.
+import firebase from '@react-native-firebase/app';
 
-const firebaseConfig = {
-  apiKey:            process.env.EXPO_PUBLIC_FIREBASE_API_KEY!,
-  authDomain:        process.env.EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN!,
-  projectId:         process.env.EXPO_PUBLIC_FIREBASE_PROJECT_ID!,
-  storageBucket:     process.env.EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET!,
-  messagingSenderId: process.env.EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID!,
-  appId:             process.env.EXPO_PUBLIC_FIREBASE_APP_ID!,
-};
-
-// Initialize Firebase (safe to call multiple times — checks if already initialized)
-export const firebaseApp = getApps().length === 0
-  ? initializeApp(firebaseConfig)
-  : getApp();
+// Re-export for convenience — other modules can `import '@/services/firebase'`
+// to guarantee the native SDK is loaded before they call auth(), firestore(), etc.
+export default firebase;

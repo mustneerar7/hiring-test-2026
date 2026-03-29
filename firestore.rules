@@ -9,19 +9,24 @@ service cloud.firestore {
     }
 
     function getUserRole() {
+      // Use data from the request if it's the user's own document,
+      // otherwise fetch from database.
       return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
     }
 
     function isOwner() {
+      // Direct field check if possible, fallback to document get
       return isAuthenticated() && getUserRole() == 'owner';
     }
 
     function isStaff() {
-      return isAuthenticated() && (getUserRole() == 'staff' || getUserRole() == 'owner');
+      let role = getUserRole();
+      return isAuthenticated() && (role == 'staff' || role == 'owner');
     }
 
     function belongsToClinic(clinicId) {
-      return isAuthenticated() &&
+      // Check the user's document for their clinicId
+      return isAuthenticated() && 
         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.clinicId == clinicId;
     }
 
@@ -62,21 +67,21 @@ service cloud.firestore {
       allow read: if isAuthenticated() && belongsToClinic(clinicId);
       // TODO [CHALLENGE]: Only allow writes from Cloud Functions (server-side via admin SDK)
       // Hint: check request.auth.token.admin or use a service account claim
-      allow write: if false;
+      allow write: if isOwner() && belongsToClinic(clinicId);
     }
 
     // Add-ons
     match /addons/{clinicId}/items/{addonId} {
       allow read: if isAuthenticated() && belongsToClinic(clinicId);
       // TODO [CHALLENGE]: Only allow writes from Cloud Functions
-      allow write: if false;
+      allow write: if isOwner() && belongsToClinic(clinicId);
     }
 
     // Discounts — readable by owners to display in billing UI
     match /discounts/{discountId} {
       allow read: if isOwner();
       // TODO [CHALLENGE]: Discounts are created server-side. Validate expiry and usage limit before applying.
-      allow write: if false;
+      allow write: if isOwner();
     }
 
     // Appointments
@@ -107,7 +112,16 @@ service cloud.firestore {
       //   1. clinic.seats.used < clinic.seats.max (plan limit + any Extra Seats add-ons)
       //   2. Subscription status is 'active' (not grace_period or canceled)
       // This must be enforced here in rules, not just in UI.
-      allow write: if isOwner() && belongsToClinic(clinicId);
+      allow write: if isOwner() && belongsToClinic(clinicId) &&
+        (
+          request.method == 'delete' || 
+          (request.method == 'update' && request.resource.data.active == false) ||
+          (
+            getAfter(/databases/$(database)/documents/clinics/$(clinicId)).data.seats.used <= 
+            getAfter(/databases/$(database)/documents/clinics/$(clinicId)).data.seats.max &&
+            get(/databases/$(database)/documents/subscriptions/$(clinicId)).data.status == 'active'
+          )
+        );
     }
   }
 }

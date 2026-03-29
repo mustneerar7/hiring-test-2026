@@ -1,12 +1,19 @@
+import '@/services/firebase';
 import auth from '@react-native-firebase/auth';
 import firestore from '@react-native-firebase/firestore';
 import type { User } from '@/types/user';
 
+import { Platform } from 'react-native';
+
 const USE_EMULATOR = process.env.EXPO_PUBLIC_USE_EMULATOR === 'true';
-const EMULATOR_HOST = process.env.EXPO_PUBLIC_EMULATOR_HOST ?? 'localhost';
+const DEFAULT_HOST = process.env.EXPO_PUBLIC_EMULATOR_HOST ?? 'localhost';
+const EMULATOR_HOST = Platform.OS === 'android' && DEFAULT_HOST === 'localhost' 
+  ? '10.0.2.2' 
+  : DEFAULT_HOST;
 
 if (USE_EMULATOR) {
   auth().useEmulator(`http://${EMULATOR_HOST}:9099`);
+  console.log(`[Auth] Connected to emulator at http://${EMULATOR_HOST}:9099`);
 }
 
 export async function signUp(
@@ -53,6 +60,7 @@ export async function refreshAuthToken(): Promise<void> {
 //
 // Whichever approach you choose, document WHY in DECISIONS.md.
 // The Firestore rule in seats/ is intentionally incomplete — your implementation goes there.
-export async function revokeUserSession(_userId: string): Promise<void> {
-  throw new Error('TODO [CHALLENGE]: Implement revokeUserSession via Cloud Function');
+export async function revokeUserSession(userId: string): Promise<void> {
+  // Option A implementation: calling the Cloud Function to sever the token remotely.
+  await auth().app.functions('us-central1').httpsCallable('revokeUserSession')({ userId });
 }

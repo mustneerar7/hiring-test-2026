@@ -21,7 +21,7 @@ import {
 } from 'firebase/firestore';
 import {
   getAuth, connectAuthEmulator,
-  createUserWithEmailAndPassword, updateProfile,
+  createUserWithEmailAndPassword, updateProfile, signInWithEmailAndPassword,
 } from 'firebase/auth';
 
 const firebaseConfig = {
@@ -74,6 +74,10 @@ async function seed() {
   const staff2Id  = await createUser('marc.staff@test.com',   'test1234', 'Marc Dubois',       'staff',   CLINIC_ID);
   const patient1Id = await createUser('patient1@test.com',    'test1234', 'Léa Fontaine',      'patient', CLINIC_ID);
   const patient2Id = await createUser('patient2@test.com',    'test1234', 'Thomas Müller',     'patient', CLINIC_ID);
+  
+  // Re-sign in as owner to perform administrative writes (clinics, subscriptions, etc.)
+  await signInWithEmailAndPassword(auth, 'sophie.owner@test.com', 'test1234');
+  console.log('  ✓ Authenticated as owner (Sophie Moreau)');
 
   // Clinic
   console.log('\nCreating clinic...');
@@ -83,7 +87,7 @@ async function seed() {
     plan: 'pro',
     seats: { used: 2, max: 5 }, // 2 staff on Pro (5 seat limit)
     addons: ['addon_storage_001'],
-    activeDiscounts: ['WELCOME20'],
+    activeDiscounts: ['WELCOME20', 'ADDONS15'],
     createdAt: Timestamp.now(),
   });
   console.log('  ✓ Clinic: Alpine Aesthetics Clinic');

@@ -1,16 +1,17 @@
 import React, { useEffect, useState } from 'react';
 import {
-  View, Text, ScrollView, StyleSheet, TouchableOpacity, Alert,
+  View, Text, ScrollView, StyleSheet, TouchableOpacity, Alert, Linking,
 } from 'react-native';
 import { useAuth } from '@/hooks/useAuth';
 import { useClinic } from '@/hooks/useClinic';
 import { useSubscription } from '@/hooks/useSubscription';
 import { getClinicAddons, getClinicDiscounts } from '@/services/firestore';
+import { createCheckoutSession, purchaseAddon } from '@/services/stripe';
 import { PlanBadge } from '@/components/PlanBadge';
 import { SeatUsageBar } from '@/components/SeatUsageBar';
 import { DiscountTag } from '@/components/DiscountTag';
 import { ADDON_CONFIG } from '@/types/subscription';
-import type { Addon } from '@/types/subscription';
+import type { Addon, Plan } from '@/types/subscription';
 import type { Discount } from '@/types/discount';
 
 export default function BillingScreen() {
@@ -19,6 +20,7 @@ export default function BillingScreen() {
   const { plan, status, config, seatsUsed, seatsMax } = useSubscription();
   const [addons, setAddons] = useState<Addon[]>([]);
   const [discounts, setDiscounts] = useState<Discount[]>([]);
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     if (!clinic) return;
@@ -34,17 +36,47 @@ export default function BillingScreen() {
     );
   }
 
-  function handleUpgrade() {
-    // TODO [CHALLENGE]: Open Stripe Checkout via createCheckoutSession (stripe.ts)
-    // Navigate to a plan selection screen, then call createCheckoutSession.
-    // After checkout, Stripe webhook → Cloud Function → Firestore update.
-    Alert.alert('TODO', 'Implement Stripe Checkout (Scenario 1)');
+  async function handleUpgrade() {
+    if (loading || !clinic) return;
+    
+    // For Scenario 1, we simulate upgrading to Pro.
+    // In a real app, this would show a "Plan Selection" modal first.
+    setLoading(true);
+    try {
+      const { url } = await createCheckoutSession({
+        clinicId: clinic.id,
+        plan: 'pro',
+      });
+      if (url) {
+        Linking.openURL(url);
+      }
+    } catch (err: any) {
+      console.error('Checkout error:', err);
+      Alert.alert('Error', err.message || 'Failed to start checkout');
+    } finally {
+      setLoading(false);
+    }
   }
 
-  function handlePurchaseAddon(addonType: string) {
-    // TODO [CHALLENGE]: Call purchaseAddon from stripe.ts
-    // Remember: validate applicable discounts server-side (Scenario 3)
-    Alert.alert('TODO', `Implement add-on purchase for ${addonType} (Scenario 3)`);
+  async function handlePurchaseAddon(addonType: any) {
+    if (loading || !clinic) return;
+    
+    setLoading(true);
+    try {
+      await purchaseAddon({
+        clinicId: clinic.id,
+        addonType,
+      });
+      Alert.alert('Success', 'Add-on purchased successfully');
+      // Refresh addons
+      const fresh = await getClinicAddons(clinic.id);
+      setAddons(fresh);
+    } catch (err: any) {
+      console.error('Addon purchase error:', err);
+      Alert.alert('Error', err.message || 'Failed to purchase add-on');
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (

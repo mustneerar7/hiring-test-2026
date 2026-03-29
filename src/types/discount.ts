@@ -29,9 +29,25 @@ export function isDiscountValid(discount: Discount): boolean {
 //   - Existing subscribers with an active Stripe subscription item using the discount:
 //     decide whether to honor until renewal or strip immediately. Document your decision.
 export function calculateDiscountedPrice(
-  _basePrice: number,
-  _itemType: 'base' | AddonType,
-  _discount: Discount,
+  basePrice: number,
+  itemType: "base" | AddonType,
+  discount: Discount,
 ): number {
-  throw new Error('TODO [CHALLENGE]: Implement calculateDiscountedPrice');
+  if (!isDiscountValid(discount)) return basePrice;
+
+  let applies = false;
+  if (itemType === "base") {
+    applies = discount.appliesToBase;
+  } else {
+    applies = 
+      discount.appliesToAddons === "all" || 
+      (Array.isArray(discount.appliesToAddons) && discount.appliesToAddons.includes(itemType));
+  }
+
+  if (applies) {
+    const discountAmount = (basePrice * discount.percentOff) / 100;
+    return Math.max(0, basePrice - discountAmount);
+  }
+
+  return basePrice;
 }

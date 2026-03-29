@@ -1,3 +1,4 @@
+import '@/services/firebase';
 import React, { useEffect } from 'react';
 import { Stack } from 'expo-router';
 import { initAuthListener, useAuthStore } from '@/store/authStore';

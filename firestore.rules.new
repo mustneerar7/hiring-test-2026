@@ -1,0 +1,113 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getUserRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isOwner() {
+      return isAuthenticated() && getUserRole() == 'owner';
+    }
+
+    function isStaff() {
+      return isAuthenticated() && (getUserRole() == 'staff' || getUserRole() == 'owner');
+    }
+
+    function belongsToClinic(clinicId) {
+      return isAuthenticated() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.clinicId == clinicId;
+    }
+
+    function getClinicPlan(clinicId) {
+      return get(/databases/$(database)/documents/subscriptions/$(clinicId)).data.plan;
+    }
+
+    function clinicIsActive(clinicId) {
+      let sub = get(/databases/$(database)/documents/subscriptions/$(clinicId)).data;
+      return sub.status == 'active' || sub.status == 'grace_period';
+    }
+
+    // Clinics collection
+    match /clinics/{clinicId} {
+      allow read: if isAuthenticated() && belongsToClinic(clinicId);
+      allow create: if isAuthenticated(); // Owner creates clinic on signup
+      allow update: if isOwner() && belongsToClinic(clinicId);
+      allow delete: if false; // Clinics are never deleted via client
+    }
+
+    // Users collection
+    match /users/{userId} {
+      // Users can read their own profile; owners can read their clinic members
+      allow read: if isAuthenticated() && (
+        request.auth.uid == userId ||
+        isOwner()
+      );
+      allow create: if isAuthenticated() && request.auth.uid == userId;
+      allow update: if isAuthenticated() && (
+        request.auth.uid == userId ||
+        isOwner() // Owner can update roles
+      );
+      allow delete: if false;
+    }
+
+    // Subscriptions
+    match /subscriptions/{clinicId} {
+      allow read: if isAuthenticated() && belongsToClinic(clinicId);
+      // TODO [CHALLENGE]: Only allow writes from Cloud Functions (server-side via admin SDK)
+      // Hint: check request.auth.token.admin or use a service account claim
+      allow write: if false;
+    }
+
+    // Add-ons
+    match /addons/{clinicId}/items/{addonId} {
+      allow read: if isAuthenticated() && belongsToClinic(clinicId);
+      // TODO [CHALLENGE]: Only allow writes from Cloud Functions
+      allow write: if false;
+    }
+
+    // Discounts — readable by owners to display in billing UI
+    match /discounts/{discountId} {
+      allow read: if isOwner();
+      // TODO [CHALLENGE]: Discounts are created server-side. Validate expiry and usage limit before applying.
+      allow write: if false;
+    }
+
+    // Appointments
+    match /appointments/{appointmentId} {
+      allow read: if isAuthenticated() && (
+        // Staff and owners see all clinic appointments
+        isStaff() ||
+        // Patients see only their own
+        resource.data.patientId == request.auth.uid
+      );
+
+      allow create: if isStaff(); // Staff/owner books appointments
+
+      // TODO [CHALLENGE]: Add plan-based access control.
+      // Example: Advanced reporting (analytics on appointments) requires Premium or higher.
+      // Extra Storage add-on required to attach files to appointments.
+
+      allow update: if isStaff();
+      allow delete: if isOwner();
+    }
+
+    // Seats
+    match /seats/{clinicId}/members/{userId} {
+      allow read: if isAuthenticated() && belongsToClinic(clinicId);
+
+      // TODO [CHALLENGE]: Enforce seat limits on write.
+      // Before allowing a new seat, check:
+      //   1. clinic.seats.used < clinic.seats.max (plan limit + any Extra Seats add-ons)
+      //   2. Subscription status is 'active' (not grace_period or canceled)
+      // This must be enforced here in rules, not just in UI.
+      allow write: if isOwner() && belongsToClinic(clinicId);
+    }
+  }
+}

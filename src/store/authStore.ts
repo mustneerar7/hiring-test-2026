@@ -1,3 +1,4 @@
+import '@/services/firebase';
 import { create } from 'zustand';
 import auth from '@react-native-firebase/auth';
 import { getUser } from '@/services/firestore';
@@ -20,8 +21,13 @@ export const useAuthStore = create<AuthState>((set) => ({
   setFirebaseUser: (user) => set({ firebaseUser: user }),
 
   loadUserProfile: async (uid) => {
-    const profile = await getUser(uid);
-    set({ userProfile: profile, isLoading: false });
+    try {
+      const profile = await getUser(uid);
+      set({ userProfile: profile, isLoading: false });
+    } catch (err) {
+      console.error('[AuthStore] Failed to load user profile:', err);
+      set({ isLoading: false });
+    }
   },
 
   reset: () => set({ firebaseUser: null, userProfile: null, isLoading: false }),
