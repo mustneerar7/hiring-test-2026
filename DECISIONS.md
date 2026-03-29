@@ -1,35 +1,78 @@
-# Architecture Decisions
+# Architecture & Implementation Decisions (AI-Optimized)
 
-## Scenario 2: Downgrade Strategy
-**Decision:** Immediate Block
+> [!NOTE]  
+> This document summarizes the technical decisions made for the clinic billing system. It is structured to provide clear "Decision/Rationale" pairs for both developers and AI agents.
 
-**Rationale:**
-When a clinic with 10 active staff on a Premium plan (15 seats) attempts to downgrade to a Pro plan (5 seats), I decided to **block the downgrade immediately** until the clinic owner manually deactivates 5 staff members. 
+---
 
-While queueing the downgrade for the end of the billing period might offer a slightly smoother initial UX, the "immediate block" strategy is far more transparent to the clinic owner. It forces them to make active decisions about which staff members lose access, rather than leaving those staff members in limbo or relying on an automated, potentially randomized revocation at the end of the cycle. 
+## Global Infrastructure
 
-Additionally, queueing a downgrade natively in Stripe without immediate proration requires creating `SubscriptionSchedules`, which introduces significant complexity and potential drift between Firestore state and Stripe state. The immediate block strategy ensures that Firestore and Stripe are always perfectly synchronized regarding the current capacity and plan.
+### G-01: Dynamic Price & Product Resolution
+- **Decision:** Automated product/price creation on-the-fly in `checkout.ts`.
+- **Rationale:** Minimizes manual Stripe Dashboard configuration. The system searches for existing products via `metadata['key']`. If not found, it creates them (e.g., plans or add-ons). This ensures the codebase is portable and works immediately on new Stripe accounts without pre-configured products.
+- **Implementation:** `getOrCreatePriceId(planOrAddon: string)` in `functions/src/stripe/checkout.ts`.
 
-**Implementation Details:**
-- The `initiateDowngrade` Cloud Function checks the current `used` seats against the `targetPlan` max seats.
-- If `used > limit`, it returns `{ strategy: 'immediate', conflictingSeats: used - limit }` without alerting Stripe.
-- If there's no conflict, it immediately calls `stripe.subscriptions.update` to change the price item to the lower plan, allowing Stripe to naturally prorate the account as a credit.
-- Firestore Security Rules use `getAfter` to strictly guarantee that no batch-write can ever exceed `clinics.seats.max` regardless of UI state, and ensures that the subscription is `'active'`.
+### G-02: Webhook Synchronization Strategy
+- **Decision:** Webhook-only updates for subscription state.
+- **Rationale:** Prevents race conditions and ensures Stripe remains the "Source of Truth". Firestore `subscriptions` and `clinics` documents are updated *only* upon receiving verified `customer.subscription.updated` or `checkout.session.completed` events. This ensures UI-level consistency and handles edge cases where payment methods might fail asynchronously.
+- **Implementation:** `handleStripeWebhook` in `functions/src/stripe/webhook.ts`.
 
-## Scenario 5: Expired Discount Behavior
-**Decision:** Strip on Next Invoice
+### G-03: Webhook Search & Recovery
+- **Decision:** Multi-identifier fallback search.
+- **Rationale:** Robustly links Stripe events to Firestore clinic documents by searching for `stripeSubscriptionId` first, then falling back to `stripeCustomerId`. This handles scenarios where specific Stripe events might lack metadata but contain customer references.
+- **Implementation:** `findSubscriptionDoc` in `functions/src/stripe/webhook.ts`.
 
-**Rationale:**
-When an existing subscriber has an active discount and the discount expires, I decided to immediately sever the discount on their next billing cycle rather than honoring it indefinitely. To do this effortlessly natively in Stripe, when creating the Stripe coupon dynamically in `checkout.ts`, I explicitly set `duration: "once"` instead of `duration: "forever"`. This natively offloads the expiry functionality to Stripe, ensuring that an applied discount (whether applied to the base plan or an add-on) naturally falls off after the initial purchase / current billing invoice is generated exactly mimicking "strip on next invoice".
+---
 
-## Scenario 6: Session Invalidation on Role Change
-**Decision:** Option A (`admin.auth().revokeRefreshTokens(uid)`)
+## Scenario Decisions
 
-**Rationale & Trade-offs:**
-I actively chose **Option A** (`revokeRefreshTokens`) combined with immediately turning `active: false` on their Firestore seat document + unlinking their `clinicId` in `users` collection. 
-This guarantees they dynamically drop access upon the short-lived ID token's expiration logic without taxing the Firestore database with intense global read cascades. 
+### Scenario 1: Pro-rata Mid-cycle Upgrade
+- **Decision:** Immediate Upgrade with Stripe Proration.
+- **Rationale:** When a user upgrades (e.g., Free → Pro), the system calls `stripe.subscriptions.update` with `proration_behavior: "always_invoice"`. This immediately unlocks new seats for the clinic while Stripe handles the proration logic, charging the difference on the next invoice or creating a pending credit.
+- **Implementation:** `createCheckoutSession` (direct upgrade path) in `checkout.ts`.
 
-*Trade-offs analysis:*
-- **Option B (Firestore rule check):** Extremely fast (zero latency block), but creates a massive cascading read burden on literally every single query they make across the app. This drastically inflates Firestore billing and complicates standard `allow read` policies.
-- **Option C (Custom claims disabled flag):** Needs manual re-authentication by the client to pick up the token payload changes, resulting in roughly identical propagation latency to Option A, but with extra boilerplate fetching and decoding tokens. 
-- **Option A (Chosen):** Severely punishes the user session completely terminating their authentication refresh cycle seamlessly natively. It trades a potential ~1 hour token life for incredible database cost efficiency and absolute, un-hackable global logout enforcement.
+### Scenario 2: Downgrade Strategy (Seat Conflict)
+- **Decision:** Immediate Block (Enforced by Cloud Function + Security Rules).
+- **Rationale:** Blocking downgrades if `usedSeats > targetSeats` prevents the system from having to "guess" which staff members to deactivate. The owner must manually resolve the conflict.
+- **Implementation:** 
+  - **Logic:** `initiateDowngrade` checks `activeSeats > targetConfig.seats` before calling Stripe.
+  - **Hard Enforcement:** `firestore.rules` uses `getAfter` on the `clinics` document to ensure `seats.used <= seats.max` on any write to the `seats` collection.
+
+### Scenario 3: Granular Add-on Discounts
+- **Decision:** `appliesToAddons` Metadata Validation.
+- **Rationale:** Prevents unauthorized application of base-plan discounts to expensive add-ons. The `purchaseAddon` function validates the discount's compatibility with the specific `addonType`.
+- **Implementation:** `purchaseAddon` in `checkout.ts` checks `discountData.appliesToAddons` (can be "all" or an array of specific IDs).
+
+### Scenario 4: Payment Failure & Grace Period
+- **Decision:** 7-Day "Read-Only" Grace Period + Automatic "Revert to Free" on Cancellation.
+- **Rationale:** Balances user experience with revenue protection.
+  - **Grace Period (7 days):** `invoice.payment_failed` sets `status: "grace_period"`. Rules allow reading/modifying existing appointments but block creating NEW staff seats (checks `status == 'active'`).
+  - **Revert:** On sub-deletion, the system deactivates all staff members *except* the owner and sets `seats.max` to 1.
+- **Implementation:** `handlePaymentFailed` and `handleSubscriptionDeleted` in `webhook.ts`.
+
+### Scenario 5: Expired Discount Behavior
+- **Decision:** Strip on Next Invoice (`duration: "once"`).
+- **Rationale:** Honors the discount for the initial billing cycle but natively offloads the expiry to Stripe. By setting `duration: "once"` on the Stripe Coupon, the discount naturally falls off in the next billing cycle without requiring a scheduled cron job or listener.
+- **Implementation:** Coupon creation logic in `checkout.ts`.
+
+### Scenario 6: Role Change & Session Invalidation
+- **Decision:** Option A (`admin.auth().revokeRefreshTokens(uid)`).
+- **Rationale:** Revokes the user's ability to get new ID tokens immediately. While existing tokens might last for ~1 hour, the user is globally blocked from refreshing access. This avoids the high Firestore read costs associated with checking the `active` flag on every single security rule evaluation (Option B).
+- **Implementation:** `removeStaffMember` calls `admin.auth().revokeRefreshTokens(userId)`.
+
+---
+
+## Security Schema
+
+### Clinic Access
+- **Decision:** `belongsToClinic(clinicId)` helper in Firestore.
+- **Rationale:** Every document (appointments, seats, invoices) must be scoped to a `clinicId`. The user's own document in `/users/{uid}` serves as the anchor for the `clinicId` claim, which is verified on every request.
+
+### Seat Limit Enforcement
+- **Crucial Rule:**
+```javascript
+// firestore.rules
+getAfter(/databases/$(database)/documents/clinics/$(clinicId)).data.seats.used <= 
+getAfter(/databases/$(database)/documents/clinics/$(clinicId)).data.seats.max
+```
+- **Rationale:** Uses atomic transaction snapshots to ensure that no matter how many parallel writes occur, the resulting state of the clinic can never exceed its purchased capacity.
